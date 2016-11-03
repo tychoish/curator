@@ -1,29 +1,22 @@
-#######################################
-#         YAML Templates              #
-#######################################
+####################################################
+#   Evergreen Go Project Configuration (Curator)   #
+####################################################
+
 variables:
-  - &run-build
-    # runs a build operations. The task name in evergreen should
-    # correspond to a make target for the build operation.
-    name: test
-    commands:
-      - command: git.get_project
-        params:
-          directory: gopath/src/github.com/mongodb/curator
-      - func: run-make
-        vars: { target: "${task_name}" }
-  - &run-go-test-suite
-    # runs a make target and then uploads gotest output to
-    # evergreen. The test name should correspond to a make target for
-    # that suite
+  # YAML variables and templates used to reduce redundancy later in
+  # the config.
+  - &run-suite
+    # fetches the tests dist package and runs a make target and then
+    # uploads. The test name should correspond to a make target for
+    # that suite. In the "post" task, the results are uploaded to
+    # evergreen.
     name: test
     depends_on:
       - name: build
     commands:
-      - command: git.get_project
-        params:
-          directory: gopath/src/github.com/mongodb/curator
       - func: setup-credentials
+      - func: get-dist
+        vars: { dist: "dist-test"}
       - func: run-make
         vars: { target: "${task_name}" }
 
@@ -53,7 +46,7 @@ variables:
       - name: coverage
       - name: push
   - &race-detector-tasks
-      - name: build-race
+      - name: build
       - name: race-curator
       - name: race-main
       - name: race-sthree
@@ -82,21 +75,28 @@ functions:
          aws_access_key_id = ${aws_key}
          aws_secret_access_key = ${aws_secret}
          EOF
+  get-dist:
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      bucket: mciuploads
+      remote_file: curator/${build_id}-${build_variant}/curator-${dist|dist}-${revision}.tar.gz
+      extract_to: ${path|gopath/src/github.com/mongodb/curator}
   run-make:
     command: shell.exec
     params:
-       script: |
+      working_dir: gopath/src/github.com/mongodb/curator
+      script: |
          set -o errexit
          set -o verbose
 
          # Configure a local go path for this build.
-         export GOPATH=`pwd`/gopath
-
-         cd gopath/src/github.com/mongodb/curator
+         export GOPATH=${workdir}/gopath/
 
          # Run make, called with proper environment variables set,
          # running the target.
-         ${build_env} make vendor ${target}
+         ${build_env} make ${target}
   upload-coverage:
     command: s3.put
     params:
@@ -113,12 +113,12 @@ functions:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: gopath/src/github.com/mongodb/curator/build/dist.tar.gz
-      remote_file: curator/${build_id}-${build_variant}/curator-dist-${revision}.tar.gz
+      local_file: gopath/src/github.com/mongodb/curator/build/${dist}.tar.gz
+      remote_file: curator/${build_id}-${build_variant}/curator-${dist}-${revision}.tar.gz
       bucket: mciuploads
       content_type: application/x-gzip
       permissions: public-read
-      display_name: curator-dist.tar.gz
+      display_name: curator-${dist}.tar.gz
 
 
 #######################################
@@ -133,22 +133,31 @@ tasks:
         params:
           directory: gopath/src/github.com/mongodb/curator
       - func: run-make
-        vars: { target: "build dist" }
+        vars: { target: "vendor build dist dist-test dist-source" }
       - func: upload-dist
-  - <<: *run-build
-    name: build-race
-  - <<: *run-build
-    name: lint
-
+        vars: { dist: "dist"}
+      - func: upload-dist
+        vars: { dist: "dist-source"}
+      - func: upload-dist
+        vars: { dist: "dist-test"}
+  - name: lint
+    depends_on:
+      - name: build
+    commands:
+      - func: get-dist
+        vars: { dist: "dist-source", path: "gopath/src/github.com/mongodb"}
+      - func: run-make
+        vars: { target: "lint"}
   # The coverage task is less generic.
   - name: coverage
     depends_on:
       - name: build
     commands:
-      - command: git.get_project
-        params:
-          directory: gopath/src/github.com/mongodb/curator
       - func: setup-credentials
+      - func: get-dist
+        vars: { dist: "dist-test"}
+      - func: get-dist
+        vars: { dist: "dist-source", path: "gopath/src/github.com/mongodb"}
       - func: run-make
         vars: { target: "coverage-html"}
       - func: upload-coverage
@@ -163,38 +172,28 @@ tasks:
         vars: { name: "repobuilder"}
 
   # define tasks for all test suites (modules)
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: test-operations
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: test-main
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: test-curator
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: test-sthree
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: test-repobuilder
 
   # run the suites with the race detector (one variant only)
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: race-operations
-    depends_on:
-      - name: build-race
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: race-main
-    depends_on:
-      - name: build-race
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: race-curator
-    depends_on:
-      - name: build-race
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: race-sthree
-    depends_on:
-      - name: build-race
-  - <<: *run-go-test-suite
+  - <<: *run-suite
     name: race-repobuilder
-    depends_on:
-      - name: build-race
 
   - name: push
     patchable: false
@@ -216,12 +215,11 @@ post:
   - command: gotest.parse_files
     params:
       files:
-        - "gopath/src/github.com/mongodb/curator/build/test.*.out"
-        - "gopath/src/github.com/mongodb/curator/build/race.*.out"
+        - "gopath/src/github.com/mongodb/curator/build/output.*.test"
+        - "gopath/src/github.com/mongodb/curator/build/output.*.race"
   - command: shell.exec
     params:
       script: |
-        rm -rf curator
         rm -rf ~/.aws
 
 #######################################
@@ -247,7 +245,7 @@ buildvariants:
     expansions:
       build_env: "PATH=/opt/go:$PATH"
     run_on:
-      - rhel70
+      - rhel70-small
     tasks:
       *test-tasks
 

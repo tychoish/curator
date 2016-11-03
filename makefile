@@ -42,10 +42,12 @@ gopath := $(shell go env GOPATH)
 lintDeps := $(addprefix $(gopath)/src/,$(lintDeps))
 srcFiles := makefile $(shell find . -name "*.go" -not -path "./$(buildDir)/*" -not -name "*_test.go" -not -path "./buildscripts/*" )
 testSrcFiles := makefile $(shell find . -name "*.go" -not -path "./$(buildDir)/*")
-testOutput := $(foreach target,$(packages),$(buildDir)/test.$(target).out)
-raceOutput := $(foreach target,$(packages),$(buildDir)/race.$(target).out)
-coverageOutput := $(foreach target,$(packages),$(buildDir)/coverage.$(target).out)
-coverageHtmlOutput := $(foreach target,$(packages),$(buildDir)/coverage.$(target).html)
+testOutput := $(foreach target,$(packages),$(buildDir)/output.$(target).test)
+raceOutput := $(foreach target,$(packages),$(buildDir)/output.$(target).race)
+testBin := $(foreach target,$(packages),$(buildDir)/test.$(target))
+raceBin := $(foreach target,$(packages),$(buildDir)/race.$(target))
+coverageOutput := $(foreach target,$(packages),$(buildDir)/output.$(target).coverage)
+coverageHtmlOutput := $(foreach target,$(packages),$(buildDir)/output.$(target).coverage.html)
 $(gopath)/src/%:
 	@-[ ! -d $(gopath) ] && mkdir -p $(gopath) || true
 	go get $(subst $(gopath)/src/,,$@)
@@ -65,6 +67,8 @@ coverage:$(coverageOutput)
 coverage-html:$(coverageHtmlOutput)
 phony := lint lint-deps build build-race race test coverage coverage-html
 .PRECIOUS: $(testOutput) $(raceOutput) $(coverageOutput) $(coverageHtmlOutput)
+.PRECIOUS: $(foreach target,$(packages),$(buildDir)/test.$(target))
+.PRECIOUS: $(foreach target,$(packages),$(buildDir)/race.$(target))
 # end front-ends
 
 
@@ -81,26 +85,30 @@ phony += $(buildDir)/$(name)
 
 
 # distribution targets and implementation
+$(buildDir)/make-tarball:buildscripts/make-tarball.go $(buildDir)/render-gopath
+	$(renderGopath) go build -o $@ $<
 dist:$(buildDir)/dist.tar.gz
+dist-test:$(buildDir)/dist-test.tar.gz
+dist-source:$(buildDir)/dist-source.tar.gz
 $(buildDir)/dist.tar.gz:$(buildDir)/$(name)
 	tar -C $(buildDir) -czvf $@ $(name)
+$(buildDir)/dist-test.tar.gz:makefile $(testBin) $(raceBin) $(buildDir)/$(name) $(buildDir)/$(name).race
+	tar -czvf $@ $^
+$(buildDir)/dist-source.tar.gz:$(buildDir)/make-tarball $(srcFiles) $(testSrcFiles) makefile
+	./$< --name $@ --prefix $(name) $(subst $(name),,$(foreach pkg,$(packages),--item ./$(pkg))) --item ./buildscripts --item makefile --exclude "$(name)" --exclude "^.git/" --exclude "$(buildDir)/"
 # end main build
 
 
 # convenience targets for runing tests and coverage tasks on a
 # specific package.
-makeArgs := --no-print-directory
-race-%:
-	@$(MAKE) $(makeArgs) $(buildDir)/race.$*.out
-	@grep -s -q -e "^PASS" $(buildDir)/race.$*.out
-test-%:
-	@$(MAKE) $(makeArgs) $(buildDir)/test.$*.out
-	@grep -s -q -e "^PASS" $(buildDir)/test.$*.out
-coverage-%:
-	@$(MAKE) $(makeArgs) $(buildDir)/coverage.$*.out
-	@grep -s -q -e "^PASS" $(buildDir)/coverage.$*.out
-html-coverage-%:
-	@$(MAKE) $(makeArgs) $(buildDir)/coverage.$*.html
+race-%:$(buildDir)/output.%.race
+	@grep -s -q -e "^PASS" $<
+test-%:$(buildDir)/output.%.test
+	@grep -s -q -e "^PASS" $<
+coverage-%:$(buildDir)/output.%.coverage
+	@grep -s -q -e "^PASS" $<
+html-coverage-%:$(buildDir)/output.%.coverage.html
+	@grep -s -q -e "^PASS" $<
 # end convienence targets
 
 
@@ -169,26 +177,31 @@ phony += vendor vendor-deps vendor-clean vendor-sync change-go-version
 #    This varable includes everything that the tests actually need to
 #    run. (The "build" target is intentional and makes these targetsb
 #    rerun as expected.)
-testRunDeps := $(testSrcFiles) $(name) build
-testArgs := -v --timeout=20m
+testRunDeps := $(name)
+testArgs := -test.v --test.timeout=20m
 #    implementation for package coverage and test running, to produce
 #    and save test output.
-$(buildDir)/coverage.%.html:$(buildDir)/coverage.%.out
+#  targets to compile
+$(buildDir)/test.%:$(testSrcFiles)
+	$(vendorGopath) go test -covermode=count -c -o $@ ./$*
+$(buildDir)/race.%:$(testSrcFiles)
+	$(vendorGopath) go test -race -c -o $@ ./$*
+#  targets to run any tests in the top-level package
+$(buildDir)/test.$(name):$(testSrcFiles)
+	$(vendorGopath) go test -covermode=count -c -o $@ ./
+$(buildDir)/race.$(name):$(testSrcFiles)
+	$(vendorGopath) go test -race -c -o $@ ./
+#  targets to run the tests and report the output
+$(buildDir)/output.%.test:$(buildDir)/test.% .FORCE
+	./$< $(testArgs) | tee $@
+$(buildDir)/output.%.race:$(buildDir)/race.% .FORCE
+	./$< $(testArgs) | tee $@
+#  targets to process and generate coverage reports
+$(buildDir)/output.%.coverage:$(buildDir)/test.% .FORCE
+	./$< $(testArgs) -test.coverprofile=$@
+	@-[ -f $@ ] && go tool cover -func=$@ | sed 's%$(projectPath)/%%' | column -t
+$(buildDir)/output.%.coverage.html:$(buildDir)/output.%.coverage
 	$(vendorGopath) go tool cover -html=$< -o $@
-$(buildDir)/coverage.%.out:$(testRunDeps)
-	$(vendorGopath) go test -v -covermode=count -coverprofile=$@ $(projectPath)/$*
-	@-[ -f $@ ] && go tool cover -func=$@ | sed 's%$(projectPath)/%%' | column -t
-$(buildDir)/coverage.$(name).out:$(testRunDeps)
-	$(vendorGopath) go test -covermode=count -coverprofile=$@ $(projectPath)
-	@-[ -f $@ ] && go tool cover -func=$@ | sed 's%$(projectPath)/%%' | column -t
-$(buildDir)/test.%.out:$(testRunDeps)
-	$(vendorGopath) go test $(testArgs) ./$* | tee $@
-$(buildDir)/test.$(name).out:$(testRunDeps)
-	$(vendorGopath) go test $(testArgs) ./ | tee $@
-$(buildDir)/race.%.out:$(testRunDeps)
-	$(vendorGopath) go test $(testArgs) -race ./$* | tee $@
-$(buildDir)/race.$(name).out:$(testRunDeps)
-	$(vendorGopath) go test $(testArgs) -race ./ | tee $@
 # end test and coverage artifacts
 
 
@@ -199,4 +212,5 @@ phony += clean
 # end dependency targets
 
 # configure phony targets
-.PHONY:$(phony)
+.FORCE:
+.PHONY:$(phony) .FORCE
